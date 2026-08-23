@@ -1,13 +1,19 @@
 import type { Principal } from "./auth";
 import { makeRepo, type Repo } from "./repo";
 import { calculatorTools } from "./calculator-tools";
+
 export type ToolDef = {
   name: string;
   description: string;
-  parameters: Record<string, unknown>; // JSON Schema
+  parameters: Record<string, unknown>;
   staffOnly?: boolean;
   execute: (args: Record<string, unknown>, ctx: { principal: Principal; repo: Repo }) => Promise<unknown>;
 };
+
+let docToolProvider: (() => ToolDef | null) | null = null;
+export function setDocToolProvider(fn: () => ToolDef | null) {
+  docToolProvider = fn;
+}
 
 function accountTools(repo: Repo): ToolDef[] {
   return [
@@ -102,8 +108,12 @@ function ticketTools(repo: Repo): ToolDef[] {
 }
 
 export function getToolRegistry(repo: Repo, principal: Principal): ToolDef[] {
-  const all = [...accountTools(repo), ...orderTools(repo), ...ticketTools(repo), ...calculatorTools(repo)];
-  return all.filter((t) => !t.staffOnly || principal.kind === "staff");
+  const base = [...accountTools(repo), ...orderTools(repo), ...ticketTools(repo), ...calculatorTools(repo)];
+  if (docToolProvider) {
+    const t = docToolProvider();
+    if (t) base.push(t);
+  }
+  return base.filter((t) => !t.staffOnly || principal.kind === "staff");
 }
 
 export function toOpenAITools(tools: ToolDef[]) {
@@ -113,7 +123,6 @@ export function toOpenAITools(tools: ToolDef[]) {
   }));
 }
 
-// Generic executor used by agent loop
 export async function executeTool(
   name: string,
   args: Record<string, unknown>,
