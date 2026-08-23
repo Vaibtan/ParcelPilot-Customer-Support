@@ -5,24 +5,37 @@ type Principal =
   | { kind: "staff"; role: string };
 
 type Msg = { role: "user" | "assistant" | "system"; content: string };
+type ToolEvent = { name: string; args: unknown; result: unknown };
 
-function parseSseStream(text: string): string {
-  let out = "";
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (!t.startsWith("data:")) continue;
-    const payload = t.slice(5).trim();
-    if (payload === "[DONE]") continue;
-    try {
-      const j = JSON.parse(payload);
-      const delta = j.choices?.[0]?.delta?.content ?? j.choices?.[0]?.message?.content ?? "";
-      if (delta) out += delta;
-      if (j.error) out += `\n[error: ${j.error}]`;
-    } catch {
-      if (payload && payload !== "[DONE]") out += payload;
+function parseSseBuffer(buffer: string): { text: string; tools: ToolEvent[] } {
+  let text = "";
+  const tools: ToolEvent[] = [];
+  for (const block of buffer.split("\n\n")) {
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event: tool_call")) {
+        // next data line is tool payload — handle in block
+      }
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        const j = JSON.parse(payload);
+        if (j.name && j.args !== undefined) {
+          tools.push(j as ToolEvent);
+          continue;
+        }
+        const delta = j.choices?.[0]?.delta?.content ?? "";
+        if (delta) text += delta;
+      } catch {
+        // Check if payload is tool event JSON
+        try {
+          const j = JSON.parse(payload);
+          if (j.name) tools.push(j);
+        } catch {}
+      }
     }
   }
-  return out;
+  return { text, tools };
 }
 
 export function App() {
@@ -30,9 +43,11 @@ export function App() {
   const [personas, setPersonas] = useState<{ accounts: { id: string; name: string }[]; staff: { role: string; label: string } } | null>(null);
   const [token, setToken] = useState<string | null>(() => localStorage.getItem("pp_token"));
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [health, setHealth] = useState("");
+  const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -46,7 +61,6 @@ export function App() {
       .catch(() => {});
   }, []);
 
-  // Verify stored token
   useEffect(() => {
     if (!token) return;
     fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
@@ -64,7 +78,7 @@ export function App() {
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, busy]);
+  }, [messages, busy, toolEvents]);
 
   async function login(accountId: string) {
     const res = await fetch("/api/auth/login", {
@@ -81,6 +95,8 @@ export function App() {
     setToken(j.token);
     setPrincipal(j.principal);
     setMessages([]);
+    setConversationId(null);
+    setToolEvents([]);
   }
 
   async function logout() {
@@ -89,6 +105,8 @@ export function App() {
     setToken(null);
     setPrincipal(null);
     setMessages([]);
+    setConversationId(null);
+    setToolEvents([]);
   }
 
   async function send() {
@@ -98,12 +116,14 @@ export function App() {
     setMessages(next);
     setInput("");
     setBusy(true);
+    setToolEvents([]);
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           messages: next.filter((m) => m.role !== "system").map((m) => ({ role: m.role, content: m.content })),
+          conversationId: conversationId ?? undefined,
         }),
       });
       if (!res.ok) {
@@ -111,37 +131,45 @@ export function App() {
         setMessages((m) => [...m, { role: "assistant", content: `Error ${res.status}: ${j.error ?? res.statusText}` }]);
         return;
       }
-      if (!res.body) {
-        setMessages((m) => [...m, { role: "assistant", content: "No response body" }]);
-        return;
-      }
+      const cid = res.headers.get("X-Conversation-Id");
+      if (cid) setConversationId(cid);
+      if (!res.body) return;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       setMessages((m) => [...m, { role: "assistant", content: "" }]);
       let buffer = "";
+      const tools: ToolEvent[] = [];
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        const parsed = parseSseStream(buffer);
+        // Incremental parse: look for tool_call events and text deltas
+        // For simplicity, re-parse full buffer each chunk (small)
+        let acc = "";
+        const localTools: ToolEvent[] = [];
+        for (const block of buffer.split("\n\n")) {
+          for (const line of block.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            try {
+              const j = JSON.parse(payload);
+              if (j.name && j.args !== undefined) {
+                // dedupe
+                if (!localTools.find((t) => t.name === j.name && JSON.stringify(t.args) === JSON.stringify(j.args))) localTools.push(j);
+                continue;
+              }
+              const delta = j.choices?.[0]?.delta?.content;
+              if (delta) acc += delta;
+            } catch {}
+          }
+        }
+        if (localTools.length) setToolEvents(localTools);
         setMessages((m) => {
           const copy = [...m];
-          copy[copy.length - 1] = { role: "assistant", content: parsed || "…" };
+          copy[copy.length - 1] = { role: "assistant", content: acc || (localTools.length ? "…" : "") };
           return copy;
         });
-      }
-      // If server returned JSON (non-stream), handle
-      if (buffer.trim().startsWith("{")) {
-        try {
-          const j = JSON.parse(buffer);
-          if (j.reply) {
-            setMessages((m) => {
-              const copy = [...m];
-              copy[copy.length - 1] = { role: "assistant", content: j.reply };
-              return copy;
-            });
-          }
-        } catch {}
       }
     } catch (e) {
       setMessages((m) => [...m, { role: "assistant", content: `Network error: ${String(e)}` }]);
@@ -208,7 +236,18 @@ export function App() {
               {m.content}
             </div>
           ))}
-          {busy && <div className="typing">Assistant is streaming…</div>}
+          {toolEvents.length > 0 && (
+            <div style={{ fontSize: 12, color: "#6b7280", background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Tool calls</div>
+              {toolEvents.map((t, i) => (
+                <div key={i} style={{ marginBottom: 4 }}>
+                  <code>{t.name}</code> <span style={{ color: "#374151" }}>{JSON.stringify(t.args)}</span>
+                  <div style={{ opacity: 0.8, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{JSON.stringify(t.result)?.slice(0, 300)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {busy && <div className="typing">Assistant is working…</div>}
         </div>
         <div className="composer">
           <input
@@ -220,7 +259,7 @@ export function App() {
                 send();
               }
             }}
-            placeholder="Ask anything…"
+            placeholder="Ask about your orders, tickets…"
             disabled={busy}
           />
           <button onClick={send} disabled={busy || !input.trim()}>

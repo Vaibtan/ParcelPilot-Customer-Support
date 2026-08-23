@@ -13,18 +13,14 @@ import {
   verifySessionToken,
   type Principal,
 } from "../lib/auth";
+import { makeRepo } from "../lib/repo";
+import { ensureConversation, saveMessage, saveRun } from "../lib/traces";
+import { runAgentLoop } from "../lib/agent";
 
 type Bindings = Env;
 type Variables = { principal: Principal };
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
-
-function runEffect<R, E, A>(effect: Effect.Effect<A, E, R>, env: Bindings): Promise<A> {
-  const program = Effect.provide(effect, makeLlmGatewayLayer(env)).pipe(
-    Effect.provide(ClockLive),
-  ) as Effect.Effect<A, E, never>;
-  return Effect.runPromise(program);
-}
 
 function secretForEnv(env: Bindings): string {
   return env.SESSION_SECRET || env.CF_AI_GATEWAY_AUTH_API_TOKEN || "dev-secret-change-me";
@@ -97,23 +93,8 @@ app.get("/api/auth/me", async (c) => {
   return c.json({ principal });
 });
 
-// Auth middleware for protected routes
-async function requireAuth(
-  c: { req: { raw: Request }; env: Bindings; json: (d: unknown, s?: number) => Response; get: (k: string) => unknown; set: (k: string, v: unknown) => void },
-  next: () => Promise<void>,
-) {
-  const secret = secretForEnv(c.env as Bindings);
-  const token = getSessionFromRequest(c.req.raw);
-  if (!token) return c.json({ error: "Authentication required" }, 401);
-  const principal = await verifySessionToken(token, secret);
-  if (!principal) return c.json({ error: "Invalid or tampered session" }, 401);
-  c.set("principal", principal);
-  await next();
-}
-
-// Protected: chat
+// Protected: chat (agent loop with traces, streaming SSE with tool events)
 app.post("/api/chat", async (c, next) => {
-  // auth gate inline (avoid Hono middleware ordering quirks)
   const secret = secretForEnv(c.env);
   const token = getSessionFromRequest(c.req.raw);
   if (!token) return c.json({ error: "Authentication required" }, 401);
@@ -124,7 +105,7 @@ app.post("/api/chat", async (c, next) => {
 }, async (c) => {
   const principal = c.get("principal") as Principal;
   const env = c.env;
-  let body: { message?: string; messages?: { role: string; content: string }[] };
+  let body: { message?: string; messages?: { role: string; content: string }[]; conversationId?: string };
   try {
     body = await c.req.json();
   } catch {
@@ -134,47 +115,114 @@ app.post("/api/chat", async (c, next) => {
     body.messages ?? (body.message ? [{ role: "user" as const, content: body.message }] : []);
   if (!messages.length) return c.json({ error: "Missing message" }, 400);
 
-  const personaNote =
-    principal.kind === "customer"
-      ? `The user is ${principal.accountName} (${principal.accountId}). Only answer from that account's data. Never reveal other accounts exist.`
-      : `The user is ParcelPilot Staff — you may access all accounts.`;
+  const conversationId = body.conversationId ?? crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  const userContent = messages[messages.length - 1]?.content ?? "";
 
-  const systemPrompt = `You are ParcelPilot Support. Today is 2026-08-16 11:00 Asia/Kolkata. ${personaNote} Answer concisely from tool results when available.`;
+  // Persist conversation + user message
+  try {
+    await ensureConversation(env.DB, conversationId, principal);
+    await saveMessage(env.DB, conversationId, "user", userContent);
+  } catch (e) {
+    console.error("trace persist error", e);
+  }
 
-  const chatMessages = [
-    { role: "system" as const, content: systemPrompt },
-    ...messages.map((m) => ({
-      role: m.role as "system" | "user" | "assistant",
-      content: String(m.content),
-    })),
-  ];
-
-  const wantStream = c.req.query("stream") !== "false";
+  const history = messages.map((m) => ({ role: m.role as "user" | "assistant", content: String(m.content) }));
+  const repo = makeRepo(env.DB);
 
   try {
-    if (wantStream) {
-      const upstream = (await runEffect(
-        Effect.flatMap(LlmGateway, (llm) => llm.chatStream(chatMessages as never)),
-        env,
-      )) as unknown as ReadableStream<Uint8Array>;
-      return new Response(upstream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          "X-Accel-Buffering": "no",
+    // Build LLM adapter from Effect layer
+    const llmAdapter = {
+      chatWithTools: async (msgs: unknown[], tools: unknown[]) => {
+        const eff = Effect.flatMap(LlmGateway, (gw) => gw.chatWithTools(msgs as never, tools));
+        const layer = makeLlmGatewayLayer(env).pipe(Effect.provide(ClockLive as never) as never);
+        // Provide both layers
+        const prog = Effect.provide(eff, makeLlmGatewayLayer(env)).pipe(Effect.provide(ClockLive)) as Effect.Effect<
+          { content: string | null; tool_calls?: { id: string; name: string; arguments: string }[]; usage?: { total_tokens?: number } },
+          unknown,
+          never
+        >;
+        return Effect.runPromise(prog);
+      },
+    };
+
+    const { stream, steps } = await Effect.runPromise(runAgentLoop(history, principal, repo, llmAdapter as never));
+
+    // Wrap stream to capture final assistant text for persistence and SSE tool events
+    let assistantText = "";
+    const db = env.DB;
+
+    // Prepend tool-call SSE events before the LLM stream
+    const toolEvents = steps
+      .filter((s) => s.kind === "tool")
+      .map((s) => `event: tool_call\ndata: ${JSON.stringify({ name: s.name, args: s.args, result: s.result })}\n\n`)
+      .join("");
+
+    const wrapped = stream.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          controller.enqueue(chunk);
+          // Extract text deltas for persistence
+          const txt = new TextDecoder().decode(chunk);
+          for (const line of txt.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const p = line.slice(5).trim();
+            if (p === "[DONE]") continue;
+            try {
+              const j = JSON.parse(p);
+              const d = j.choices?.[0]?.delta?.content;
+              if (d) assistantText += d;
+            } catch {}
+          }
         },
-      });
-    } else {
-      const text = (await runEffect(
-        Effect.flatMap(LlmGateway, (llm) => llm.chat(chatMessages as never)),
-        env,
-      )) as unknown as string;
-      return c.json({ reply: text, principal });
-    }
+        async flush(controller) {
+          // After stream done, persist run + assistant message
+          try {
+            // Reconstruct steps with final assistant chunk
+            const finalSteps = [...steps];
+            await saveRun(db, runId, conversationId, principal, finalSteps, "ok");
+            if (assistantText) await saveMessage(db, conversationId, "assistant", assistantText);
+          } catch (e) {
+            console.error("saveRun error", e);
+          }
+        },
+      }),
+    );
+
+    // Prepend tool events via a combined stream
+    const enc = new TextEncoder();
+    let prefixSent = false;
+    const combined = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        if (toolEvents) controller.enqueue(enc.encode(toolEvents));
+        const reader = wrapped.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.close();
+      },
+    });
+
+    return new Response(combined, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+        "X-Conversation-Id": conversationId,
+        "X-Run-Id": runId,
+      },
+    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // Persist failed run
+    try {
+      await saveRun(env.DB, runId, conversationId, principal, [], "error", msg);
+    } catch {}
     const status = msg.includes("Gateway") ? 502 : 500;
+    // If client expects SSE, return SSE error; else JSON
     return c.json({ error: msg }, status as 502 | 500);
   }
 });
