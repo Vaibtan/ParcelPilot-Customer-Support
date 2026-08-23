@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { TraceViewer } from "./TraceViewer";
+import { InsightsDashboard } from "./InsightsDashboard";
 
 type Principal =
   | { kind: "customer"; accountId: string; accountName: string }
@@ -20,7 +21,7 @@ export function App() {
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [pendingNonce, setPendingNonce] = useState<string | null>(null);
   const [pendingSummary, setPendingSummary] = useState<string | null>(null);
-  const [showTraces, setShowTraces] = useState(false);
+  const [view, setView] = useState<"chat" | "traces" | "insights">("chat");
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -180,10 +181,18 @@ export function App() {
 
   const label = principal.kind === "customer" ? `${principal.accountName} (${principal.accountId})` : "Staff";
 
-  if (showTraces && principal.kind === "staff") {
+  if (view === "insights" && principal.kind === "staff") {
     return (
       <div className="container">
-        <div className="header"><h1>ParcelPilot Support</h1><button onClick={() => setShowTraces(false)} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" }}>← Back to chat</button></div>
+        <div className="header"><h1>ParcelPilot Support</h1><button onClick={() => setView("chat")} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" }}>← Back</button></div>
+        <InsightsDashboard token={token!} />
+      </div>
+    );
+  }
+  if (view === "traces" && principal.kind === "staff") {
+    return (
+      <div className="container">
+        <div className="header"><h1>ParcelPilot Support</h1><button onClick={() => setView("chat")} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" }}>← Back to chat</button></div>
         <TraceViewer token={token!} />
       </div>
     );
@@ -195,7 +204,7 @@ export function App() {
         <h1>ParcelPilot Support</h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span className="badge">{label}</span>
-          {principal.kind === "staff" && <button onClick={() => setShowTraces(true)} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #1a56db", background: "#e8f0fe", color: "#1a56db", cursor: "pointer" }}>Traces</button>}
+          {principal.kind === "staff" && <><button onClick={() => setView("insights")} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #1a56db", background: "#e8f0fe", color: "#1a56db", cursor: "pointer" }}>Insights</button><button onClick={() => setView("traces")} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #1a56db", background: "#e8f0fe", color: "#1a56db", cursor: "pointer" }}>Traces</button></>}
           <button onClick={logout} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" }}>Switch</button>
         </div>
       </div>

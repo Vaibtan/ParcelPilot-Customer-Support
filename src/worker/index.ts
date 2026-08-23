@@ -19,6 +19,7 @@ import { runAgentLoop } from "../lib/agent";
 import { setDocToolProvider, setActionToolProvider } from "../lib/tools";
 import { docSearchTool } from "../lib/doc-search-tool";
 import { actionTools, confirmPendingAction, declinePendingAction } from "../lib/actions";
+import { allInsights } from "../lib/detectors";
 
 type Bindings = Env;
 type Variables = { principal: Principal };
@@ -101,7 +102,36 @@ app.get("/api/traces/:id", async (c) => {
   return c.json({ run, steps: steps.results, messages: msgs.results });
 });
 
-// Chat with agent loop
+app.get("/api/insights", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const p = await verifySessionToken(token, secret);
+  if (!p) return c.json({ error: "Invalid session" }, 401);
+  if (p.kind !== "staff") return c.json({ error: "Staff only" }, 403);
+  const r = await c.env.DB.prepare("SELECT * FROM insights ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at DESC").all();
+  return c.json({ insights: r.results });
+});
+
+app.post("/api/insights/recompute", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const p = await verifySessionToken(token, secret);
+  if (!p) return c.json({ error: "Invalid session" }, 401);
+  if (p.kind !== "staff") return c.json({ error: "Staff only" }, 403);
+  const tickets = (await c.env.DB.prepare("SELECT * FROM tickets").all()).results as never[];
+  const orders = (await c.env.DB.prepare("SELECT * FROM orders").all()).results as never[];
+  const accounts = (await c.env.DB.prepare("SELECT * FROM accounts").all()).results as never[];
+  const insights = allInsights(tickets as never, orders as never, accounts as never);
+  await c.env.DB.prepare("DELETE FROM insights").run();
+  for (const ins of insights) {
+    await c.env.DB.prepare("INSERT INTO insights (id, type, severity, title, summary, evidence_json, rationale) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(ins.id, ins.type, ins.severity, ins.title, ins.summary, ins.evidence_json, ins.rationale).run();
+  }
+  return c.json({ ok: true, count: insights.length });
+});
+
+// Chat
 app.post("/api/chat", async (c, next) => {
   const secret = secretForEnv(c.env);
   const token = getSessionFromRequest(c.req.raw);
@@ -214,5 +244,17 @@ export default {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async fetch(request: Request, env: Env, ctx: any): Promise<Response> { return app.fetch(request, env, ctx); },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async scheduled(event: any, _env: Env, _ctx: any) { console.log("cron tick", event.cron); },
+  async scheduled(event: any, env: Env, _ctx: any) {
+    console.log("cron tick", event.cron);
+    // Recompute insights on schedule
+    try {
+      const tickets = (await env.DB.prepare("SELECT * FROM tickets").all()).results as never[];
+      const orders = (await env.DB.prepare("SELECT * FROM orders").all()).results as never[];
+      const accounts = (await env.DB.prepare("SELECT * FROM accounts").all()).results as never[];
+      const insights = allInsights(tickets as never, orders as never, accounts as never);
+      await env.DB.prepare("DELETE FROM insights").run();
+      for (const ins of insights) await env.DB.prepare("INSERT INTO insights (id, type, severity, title, summary, evidence_json, rationale) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(ins.id, ins.type, ins.severity, ins.title, ins.summary, ins.evidence_json, ins.rationale).run();
+      console.log(`insights recomputed: ${insights.length}`);
+    } catch (e) { console.error("cron insight error", e); }
+  },
 };
