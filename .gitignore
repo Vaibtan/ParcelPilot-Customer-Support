@@ -1,0 +1,12 @@
+.agents/
+.claude/
+.commandcode/
+.env
+.dev.vars
+.scratch/
+dist/
+.wrangler/
+node_modules/
+image.png
+AI Agent Assessment - Candidate Pack/
+TASK.md

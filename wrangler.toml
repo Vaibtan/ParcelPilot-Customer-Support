@@ -1,0 +1,28 @@
+name = "parcelpilot-support"
+main = "src/worker/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+CF_ACCOUNT_ID = "8f74ed3dc133e7662ff6889883764bc0"
+CF_AI_GATEWAY_NAME = "parcelpilot-cf-gateway"
+LLM_MODEL = "gpt-4o-mini"
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "parcelpilot-db"
+database_id = "5455fec7-d44d-4ade-8263-96e645fce6b3"
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "parcelpilot-docs"
+
+[triggers]
+crons = ["0 * * * *"]
+
+[observability]
+enabled = true
+
+[assets]
+directory = "dist/client"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
