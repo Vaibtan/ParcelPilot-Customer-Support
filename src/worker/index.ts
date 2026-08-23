@@ -16,16 +16,16 @@ import {
 import { makeRepo } from "../lib/repo";
 import { ensureConversation, saveMessage, saveRun } from "../lib/traces";
 import { runAgentLoop } from "../lib/agent";
-import { setDocToolProvider } from "../lib/tools";
+import { setDocToolProvider, setActionToolProvider } from "../lib/tools";
 import { docSearchTool } from "../lib/doc-search-tool";
+import { actionTools, confirmPendingAction, declinePendingAction } from "../lib/actions";
 
 type Bindings = Env;
 type Variables = { principal: Principal };
-
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 function secretForEnv(env: Bindings): string {
-  return env.SESSION_SECRET || env.CF_AI_GATEWAY_AUTH_API_TOKEN || "dev-secret-change-me";
+  return (env as unknown as { SESSION_SECRET?: string }).SESSION_SECRET || env.CF_AI_GATEWAY_AUTH_API_TOKEN || "dev-secret-change-me";
 }
 
 app.get("/api/health", async (c) => {
@@ -35,9 +35,7 @@ app.get("/api/health", async (c) => {
   try {
     const r = (await env.DB.prepare("SELECT 1 as v").first()) as { v: number } | null;
     dbOk = r?.v === 1;
-  } catch {
-    dbOk = !!env.DB;
-  }
+  } catch { dbOk = !!env.DB; }
   vectorizeOk = !!env.VECTORIZE;
   return c.json({ ok: true, db: dbOk ? "ok" : "unavailable", vectorize: vectorizeOk ? "ok" : "unavailable", model: env.LLM_MODEL ?? "not-set", gateway: env.CF_AI_GATEWAY_NAME ?? "not-set" });
 });
@@ -65,9 +63,7 @@ app.post("/api/auth/login", async (c) => {
   return c.json({ principal, token }, { headers: { "Set-Cookie": sessionCookie(token) } });
 });
 
-app.post("/api/auth/logout", (c) => {
-  return c.json({ ok: true }, { headers: { "Set-Cookie": clearSessionCookie() } });
-});
+app.post("/api/auth/logout", (c) => c.json({ ok: true }, { headers: { "Set-Cookie": clearSessionCookie() } }));
 
 app.get("/api/auth/me", async (c) => {
   const secret = secretForEnv(c.env);
@@ -78,6 +74,7 @@ app.get("/api/auth/me", async (c) => {
   return c.json({ principal });
 });
 
+// Chat with agent loop
 app.post("/api/chat", async (c, next) => {
   const secret = secretForEnv(c.env);
   const token = getSessionFromRequest(c.req.raw);
@@ -100,6 +97,7 @@ app.post("/api/chat", async (c, next) => {
   const history = messages.map((m) => ({ role: m.role as "user" | "assistant", content: String(m.content) }));
   const repo = makeRepo(env.DB);
   setDocToolProvider(() => docSearchTool({ db: env.DB, index: env.VECTORIZE, env }));
+  setActionToolProvider(() => actionTools(env.DB as never));
   const llmAdapter = {
     chatWithTools: async (msgs: unknown[], tools: unknown[]) => {
       const eff = Effect.flatMap(LlmGateway, (gw) => gw.chatWithTools(msgs as never, tools));
@@ -144,7 +142,47 @@ app.post("/api/chat", async (c, next) => {
   }
 });
 
-app.get("*", async (c) => { return c.env.ASSETS.fetch(c.req.raw); });
+// Action confirm/decline
+app.post("/api/actions/confirm", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const principal = await verifySessionToken(token, secret);
+  if (!principal) return c.json({ error: "Invalid session" }, 401);
+  let body: { nonce?: string };
+  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
+  if (!body.nonce) return c.json({ error: "Missing nonce" }, 400);
+  const res = await confirmPendingAction(c.env.DB as never, body.nonce, principal);
+  if (!res.ok) return c.json({ error: res.error }, 400);
+  return c.json({ ok: true });
+});
+
+app.post("/api/actions/decline", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const principal = await verifySessionToken(token, secret);
+  if (!principal) return c.json({ error: "Invalid session" }, 401);
+  let body: { nonce?: string };
+  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
+  if (!body.nonce) return c.json({ error: "Missing nonce" }, 400);
+  const res = await declinePendingAction(c.env.DB as never, body.nonce, principal);
+  if (!res.ok) return c.json({ error: res.error }, 400);
+  return c.json({ ok: true });
+});
+
+app.get("/api/actions/log", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const principal = await verifySessionToken(token, secret);
+  if (!principal) return c.json({ error: "Invalid session" }, 401);
+  if (principal.kind !== "staff") return c.json({ error: "Staff only" }, 403);
+  const r = await c.env.DB.prepare("SELECT * FROM action_log ORDER BY executed_at DESC LIMIT 20").all();
+  return c.json({ actions: r.results });
+});
+
+app.get("*", async (c) => c.env.ASSETS.fetch(c.req.raw));
 
 export default {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
