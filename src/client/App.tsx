@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { TraceViewer } from "./TraceViewer";
 
 type Principal =
   | { kind: "customer"; accountId: string; accountName: string }
@@ -19,6 +20,7 @@ export function App() {
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [pendingNonce, setPendingNonce] = useState<string | null>(null);
   const [pendingSummary, setPendingSummary] = useState<string | null>(null);
+  const [showTraces, setShowTraces] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -117,18 +119,17 @@ export function App() {
             const payload = line.slice(5).trim();
             if (payload === "[DONE]") continue;
             try {
-              const j = JSON.parse(payload);
-              if (j.name && j.args !== undefined) {
-                const exists = localTools.find((t) => t.name === j.name && JSON.stringify(t.args) === JSON.stringify(j.args));
-                if (!exists) localTools.push(j as ToolEvent);
-                // Detect pending_action in result
-                const res2 = (j.result as { pending_action?: { nonce: string; summary: string }; nonce?: string; summary?: string }) ?? {};
-                const pa = res2.pending_action;
-                if (pa?.nonce) { pn = pa.nonce; ps = pa.summary ?? j.name; }
-                else if (res2.nonce) { pn = res2.nonce; ps = res2.summary ?? j.name; }
+              const j2 = JSON.parse(payload);
+              if (j2.name && j2.args !== undefined) {
+                const exists = localTools.find((t) => t.name === j2.name && JSON.stringify(t.args) === JSON.stringify(j2.args));
+                if (!exists) localTools.push(j2 as ToolEvent);
+                const rr = (j2.result as { pending_action?: { nonce: string; summary: string }; nonce?: string; summary?: string }) ?? {};
+                const pa = rr.pending_action;
+                if (pa?.nonce) { pn = pa.nonce; ps = pa.summary ?? j2.name; }
+                else if ((rr as { nonce?: string }).nonce) { pn = (rr as { nonce: string }).nonce; ps = (rr as { summary: string }).summary ?? j2.name; }
                 continue;
               }
-              const delta = j.choices?.[0]?.delta?.content;
+              const delta = j2.choices?.[0]?.delta?.content;
               if (delta) acc += delta;
             } catch {}
           }
@@ -146,7 +147,7 @@ export function App() {
     if (!pendingNonce || !token) return;
     const res = await fetch("/api/actions/confirm", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ nonce: pendingNonce }) });
     const j = await res.json().catch(() => ({}));
-    if (!res.ok) setMessages((m) => [...m, { role: "assistant", content: `Confirm failed: ${j.error ?? res.statusText}` }]);
+    if (!res.ok) setMessages((m) => [...m, { role: "assistant", content: `Confirm failed: ${(j as { error?: string }).error ?? res.statusText}` }]);
     else setMessages((m) => [...m, { role: "system", content: `✓ Confirmed: ${pendingSummary ?? pendingNonce}` }]);
     setPendingNonce(null);
     setPendingSummary(null);
@@ -179,12 +180,22 @@ export function App() {
 
   const label = principal.kind === "customer" ? `${principal.accountName} (${principal.accountId})` : "Staff";
 
+  if (showTraces && principal.kind === "staff") {
+    return (
+      <div className="container">
+        <div className="header"><h1>ParcelPilot Support</h1><button onClick={() => setShowTraces(false)} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" }}>← Back to chat</button></div>
+        <TraceViewer token={token!} />
+      </div>
+    );
+  }
+
   return (
     <div className="container">
       <div className="header">
         <h1>ParcelPilot Support</h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span className="badge">{label}</span>
+          {principal.kind === "staff" && <button onClick={() => setShowTraces(true)} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #1a56db", background: "#e8f0fe", color: "#1a56db", cursor: "pointer" }}>Traces</button>}
           <button onClick={logout} style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" }}>Switch</button>
         </div>
       </div>

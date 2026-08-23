@@ -74,6 +74,33 @@ app.get("/api/auth/me", async (c) => {
   return c.json({ principal });
 });
 
+app.get("/api/traces", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const p = await verifySessionToken(token, secret);
+  if (!p) return c.json({ error: "Invalid session" }, 401);
+  if (p.kind !== "staff") return c.json({ error: "Staff only" }, 403);
+  const convs = await c.env.DB.prepare("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 50").all();
+  const runs = await c.env.DB.prepare("SELECT * FROM runs ORDER BY created_at DESC LIMIT 50").all();
+  return c.json({ conversations: convs.results, runs: runs.results });
+});
+
+app.get("/api/traces/:id", async (c) => {
+  const secret = secretForEnv(c.env);
+  const token = getSessionFromRequest(c.req.raw);
+  if (!token) return c.json({ error: "Authentication required" }, 401);
+  const p = await verifySessionToken(token, secret);
+  if (!p) return c.json({ error: "Invalid session" }, 401);
+  if (p.kind !== "staff") return c.json({ error: "Staff only" }, 403);
+  const id = c.req.param("id");
+  const run = await c.env.DB.prepare("SELECT * FROM runs WHERE id = ?").bind(id).first();
+  if (!run) return c.json({ error: "Not found" }, 404);
+  const steps = await c.env.DB.prepare("SELECT * FROM steps WHERE run_id = ? ORDER BY seq").bind(id).all();
+  const msgs = await c.env.DB.prepare("SELECT * FROM messages WHERE conversation_id = (SELECT conversation_id FROM runs WHERE id = ?) ORDER BY created_at").bind(id).all();
+  return c.json({ run, steps: steps.results, messages: msgs.results });
+});
+
 // Chat with agent loop
 app.post("/api/chat", async (c, next) => {
   const secret = secretForEnv(c.env);
@@ -142,7 +169,6 @@ app.post("/api/chat", async (c, next) => {
   }
 });
 
-// Action confirm/decline
 app.post("/api/actions/confirm", async (c) => {
   const secret = secretForEnv(c.env);
   const token = getSessionFromRequest(c.req.raw);
