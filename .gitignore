@@ -7,7 +7,7 @@
 dist/
 .wrangler/
 node_modules/
+data/corpus/chunks-with-embeddings.json
 image.png
 AI Agent Assessment - Candidate Pack/
 TASK.md
-embeddings
