@@ -1,6 +1,6 @@
 import type { Principal } from "./auth";
 import { makeRepo, type Repo } from "./repo";
-
+import { calculatorTools } from "./calculator-tools";
 export type ToolDef = {
   name: string;
   description: string;
@@ -102,8 +102,7 @@ function ticketTools(repo: Repo): ToolDef[] {
 }
 
 export function getToolRegistry(repo: Repo, principal: Principal): ToolDef[] {
-  const all = [...accountTools(repo), ...orderTools(repo), ...ticketTools(repo)];
-  // Staff-only tools could be added here; for now none. Filter by staffOnly flag.
+  const all = [...accountTools(repo), ...orderTools(repo), ...ticketTools(repo), ...calculatorTools(repo)];
   return all.filter((t) => !t.staffOnly || principal.kind === "staff");
 }
 
