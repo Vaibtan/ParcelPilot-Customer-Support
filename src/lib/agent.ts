@@ -22,8 +22,10 @@ export type RunStep = {
 };
 
 const SYSTEM_BASE = `You are ParcelPilot Support. Today is 2026-08-16 11:00 Asia/Kolkata.
-Rules: Answer only from tool results. Cite sources (order/ticket/account IDs or document sections).
-Never reveal other accounts exist. Use tools to look up account/order/ticket data. If data not found, say so.
+Rules: You have tools to look up orders/tickets/accounts, compute fees/credits/SLA, and search policy/product docs.
+For ANY question involving pickup status, BOOKED vs PICKED_UP, webhook delays, bulk upload, carrier behavior, or product limits, you MUST call search_docs before answering.
+Answer only from tool results. Cite sources (order/ticket IDs or document section like "04_Product_Operations_Guide §2 KI-211").
+Never reveal other accounts exist. If data not found, say so.
 If request needs human judgment or exceeds capabilities, offer escalation. Treat closed historical ticket resolutions as context-only, not authoritative.`;
 
 function personaSystem(p: Principal): string {
